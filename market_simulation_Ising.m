@@ -1,4 +1,17 @@
-function market_simulation_Ising()
+%%%==========================================================%%%
+%%%==========-======market_simulation_Ising.m================%%%
+%%%=================SOSGにIsing相互作用を導入=================%%%
+%%%==隣接するプレイヤーが存在しないため市場全体の向きDを用いる==%%%
+%%%==========履歴・戦略表の参照有・外部ニュースの導入有========%%%
+%%%==========================================================%%%
+%%%==========================================================%%%
+
+function market_simulation_Ising(beta)
+
+if nargin < 1 || isempty(beta)
+    beta = 0.50;
+end
+
     % パラメータの初期化
     iteration = 50000;   % タイムステップ50000
     M = 5;               % 履歴長（historyは0..5^M-1）
@@ -7,20 +20,25 @@ function market_simulation_Ising()
     pattern = 5^M;
 
     marketPrice    = 100; %市場価格初期値(任意)
-    preMarketPrice = marketPrice; 
+    preMarketPrice = marketPrice;
     cognitivePrice = 0; %認知的価格P(t)
 
     % 市場依存 意思決定パラメータ（ノイズ無し）
-    delta = 0.05;        % デッドゾーン |x|<delta -> 0
-    alpha = 0.90;        % K の慣性0.9
-    beta  = -1.0;        % 群衆が当たったら同調0.3
-    theta = 0.70;        % 戦略表の重み0.7
-    Kclip = 5;           % K の上下限（暴走防止）
+    delta = 0.005;        % デッドゾーン |x|<delta -> 0
+    alpha = 0.50;        % K の慣性
+    %beta  = 0.30;        % 群衆が当たったら同調
+    theta = 0.50;        % 戦略表の重み
+    Kclip = 3;           % K の上下限（暴走防止）
+
+    lambda = 10;         % Ising価格更新係数 λ
+    sigma_max = 0.1;   % 外部ニュース感度 σ_i の上限（例）
+    C_V        = 0.05;   % 私的雑音の基準分散（各エージェントに固定）
 
     % 状態
     history      = randi([0, pattern-1]);     % %全履歴パターンからランダムに1つを格納
     Dprev        = 0;                         % D(t-1)
     rprev        = 0;                         % r(t-1)
+    gprev        = 0;                         % G(t-1) の記憶（K学習用）
     players      = {};                        % プレイヤ配列
 
     % 記録
@@ -30,22 +48,27 @@ function market_simulation_Ising()
 
     %% シミュレーションループ
     for t = 1:iteration
-        if mod(t,1000)==0
+
+        g_t = randn();   % 共通ニュース G(t) ~ N(0,1)
+
+        if mod(t,5000)==0
             disp(['Timestep: ', num2str(t), ' / ', num2str(iteration)]);
         end
 
         N_current = numel(players);
         E    = 0;      % D(t)式の分母(売買の“符号”×“数量”の合計)
         Qcap = 0;      % 合計sum(q) 正規化に分母
+        Asum = 0;      % Σ a_i(t) （Ising価格更新
 
         % 1) 意思決定：a^{±}_i(t) = sign( K_i D(t-1) + theta*S_i(H) )
         for i = 1:N_current
-            [a_pm1, ~, q_i, players{i}] = decision_with_market( ...
-                players{i}, B, history, Dprev, theta, delta);
+            [a_pm1, ~, q_i, players{i}] = decision_with_market(players{i}, B, history, Dprev, theta, delta, g_t);
 
             % 集計（action_012は互換用。ここでは使わない）
             E    = E    + a_pm1 * q_i;
             Qcap = Qcap + q_i;
+
+            Asum = Asum + a_pm1;   % Ising価格用の和
         end
 
         % 2) 市場の向き D(t) と 価格生成
@@ -63,6 +86,7 @@ function market_simulation_Ising()
         end
 
         % 3) 認知側の更新
+        %move = quantize_move(deltaP, C);  % 0..4（-2..+2に対応）
         if deltaP < -C
             move = 0;
         elseif deltaP < 0
@@ -76,12 +100,23 @@ function market_simulation_Ising()
         end
 
         cognitivePrice = cognitivePrice + (move - 2);%認知的価格更新
-        history = mod(history * 5, pattern) + move;
+        history = mod(history * 5 + move, pattern);
 
-        % 4) 価格とリターン
-        marketPrice    = marketPrice + deltaP;
-        r              = log(marketPrice) - log(preMarketPrice); %r(t)=Inp(t)-Inp(t-1)
-        preMarketPrice = marketPrice; %市場価格の更新
+        % 4) 価格とリターン(SOSG加法更新)
+        %marketPrice    = marketPrice + deltaP;
+        %marketPrice = max(marketPrice + deltaP, eps);
+        %r              = log(marketPrice) - log(preMarketPrice); %r(t)=Inp(t)-Inp(t-1)
+        %preMarketPrice = marketPrice; %市場価格の更新
+
+        % 4) 価格とリターン（Ising乗法更新）
+        if N_current > 0
+            r = (1/(lambda * N_current)) * Asum;      % << NEW: r(t) = (1/(λ N)) Σ a_i(t)
+        else
+            r = 0;
+        end
+        marketPrice    = preMarketPrice * exp(r);      % << NEW: p(t) = p(t-1) * exp(r)
+        preMarketPrice = marketPrice;
+
 
         % 5) プレイヤー状態の更新・退出処理
         if N_current > 0
@@ -101,14 +136,16 @@ function market_simulation_Ising()
         end
 
         % 6) 新規参入（1人/t）
-        players{end+1} = create_player(B, pattern); %#ok<AGROW>
+        players{end+1} = create_player(B, pattern, C_V, sigma_max); 
 
         % 7) K_i の学習更新（残存プレイヤに適用）
         N_current = numel(players);
         for i = 1:N_current
-            players{i}.K = players{i}.b + alpha*players{i}.K + beta*(rprev * Dprev);
+            players{i}.K = players{i}.b + alpha*players{i}.K + beta*(rprev * gprev);
             players{i}.K = max(min(players{i}.K, Kclip), -Kclip);
         end
+        %過去値を更新
+        gprev = g_t;
         Dprev = D; 
         rprev = r; 
 
@@ -118,21 +155,32 @@ function market_simulation_Ising()
     end
 
     %% 保存
-    writematrix(capital_changes', sprintf('Ising_capital_changes_B%d.csv', B));
+    %tag = sprintf('B%d_delta%.1f_theta%.1f_beta%.1f', B, delta, theta, beta);
+    %tag = sprintf('beta%.1f', beta);
+    tag = num2str(beta, '%.15g');
 
-    writematrix(playerCounts, sprintf('Ising_player_counts_B%d.csv', B));
-    figure; plot(1:iteration, playerCounts);
-    xlabel('t'); ylabel('The number of players');
-    exportgraphics(gcf, sprintf('Ising_player_counts_B%d.pdf', B));
-
-    writematrix(returns, sprintf('Ising_return_B%d.csv', B));
-    figure; plot(returns);
-    xlabel('t'); ylabel('r(t)');
-    exportgraphics(gcf, sprintf('Ising_return_B%d.pdf', B));
+    % 資産変動を保存
+    %writematrix(capital_changes, sprintf('mult2_Ising_capital_changes_%s.csv', tag));
+        
+    % プレイヤー数を保存・描画
+    %writematrix(playerCounts, sprintf('mult2_Ising_player_counts_%s.csv', tag));
+    figure;
+    plot(1:iteration, playerCounts);
+    xlabel('t');
+    ylabel('The number of players');
+    %exportgraphics(gcf, sprintf('mult2_Ising_player_counts_%s.pdf', tag));
+        
+    % リターンを保存・描画
+    %writematrix(returns, sprintf('mult2_Ising_return_%s.csv', tag));
+    figure;
+    plot(returns);
+    xlabel('t');
+    ylabel('r(t)');
+    %exportgraphics(gcf, sprintf('mult2_Ising_return_%s.pdf', tag));
 end
 
 %% ===== プレイヤー生成（K,b を追加）=====
-function player = create_player(B, pattern)
+function player = create_player(B, pattern, C_V, sigma_max)
     player.settle = false;
     player.wealth = 10*B;
     player.quantity = 0;
@@ -149,17 +197,22 @@ function player = create_player(B, pattern)
 
     % 市場依存パラメータ
     player.K = 0.1;   % 同調強度の初期値
-    player.b = 0.0;   % 個人バイアス
+    player.b = 0.2;   % 個人バイアス
+    player.sigma = rand()*sigma_max;     % σ_i ~ U(0, σ_max)
+    player.seps   = C_V + 0.1*rand();      % 私的雑音の標準偏差 s_{ε,i}
 end
 
 %% エージェントの意思決定
-function [a_pm1, action, q_i, player] = decision_with_market(player, B, history, Dprev, theta, delta)
+function [a_pm1, action, q_i, player] = decision_with_market(player, B, history, Dprev, theta, delta, g_t)
     % 戦略表の推奨（0/1/2）→ {-1,0,+1}
     select = player.recommends(history+1);
     S_rec  = (select==2) - (select==0);   % -1/0/+1
 
     % 市場項＋戦略表のみ（ノイズ無し）
-    signal = player.K * Dprev + theta * S_rec;
+    %signal = player.K * Dprev + theta * S_rec;
+
+    %ノイズ・外部ニュースあり
+    signal = player.K * Dprev + theta * S_rec + player.sigma * g_t + player.seps  * randn();
 
     % デッドゾーン付き符号 → {-1,0,+1}
     a_pm1 = sgn0(signal, delta);
@@ -188,7 +241,14 @@ function [a_pm1, action, q_i, player] = decision_with_market(player, B, history,
     end
 
     % 互換のため 0/1/2 も返す
-    if a_pm1 < 0, action = 0; elseif a_pm1 > 0, action = 2; else, action = 1; end
+    if a_pm1 < 0
+        action = 0; 
+    elseif a_pm1 > 0
+        action = 2; 
+    else
+        action = 1; 
+    end
+
     q_i = max(player.quantity,0);
 end
 
@@ -221,18 +281,9 @@ function [player, capital_change] = update(player, B, price)
 end
 
 %% ===== 補助 =====
-%function mv = quantize_move(deltaP, C)
-    % -2..+2 を 0..4 へ写像（既存互換）
-    %if     deltaP < -C, mv = 0;
-    %elseif deltaP <  0, mv = 1;
-    %elseif deltaP >  C, mv = 4;
-    %elseif deltaP >  0, mv = 3;
-    %else,               mv = 2;
-    %end
-%end
-
 function y = sgn0(x, delta)
-    y = zeros(size(x));
+    % |x|<delta → 0,  x≥delta → +1,  x≤-delta → -1
+    y = zeros(size(x), 'like', x);
     y(x >=  delta) =  1;
     y(x <= -delta) = -1;
 end

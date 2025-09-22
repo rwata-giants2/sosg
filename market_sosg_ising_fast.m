@@ -1,11 +1,23 @@
-function market_sosg_ising_fast(n)
+%%%==========================================================%%%
+%%%==========-======market_sosg_ising_fast.m================%%%
+%%%=================SOSGにIsing相互作用を導入=================%%%
+%%%====隣接するプレイヤーの行動も影響を受ける仕組みを用いる====%%%
+%%%==========履歴・戦略表の参照有・外部ニュースの導入有========%%%
+%%%==========================================================%%%
+%%%==========================================================%%%
 
-    %% パラメータ設定
-    if nargin < 1
-        n = 50;
+function market_sosg_ising_fast(beta)
+
+    if nargin < 1 || isempty(beta)
+        beta = 0.50;
     end
 
-    iteration = 50000; %timestep50000
+    %% パラメータ設定
+    %if nargin < 1
+        n = 50;
+    %end
+
+    iteration = 20000; %timestep50000
     M = 5; %履歴長
     B = 9; %取引最小単位
     C = 3; %認知閾値
@@ -18,21 +30,25 @@ function market_sosg_ising_fast(n)
     preMarketPrice = marketPrice; %代入
     r = 0; %価格リターン(最初は０)
     playerCounts = zeros(iteration, 1); % プレイヤー数の記録用
-    
+
     %配列の初期化
     %capital_changes = [];%資本変動量を記録する配列
-    capital_changes_prealloc = zeros(iteration * 2, 1); % 넉넉한 사이즈를 미리 확보
+    capital_changes_prealloc = zeros(iteration * 2, 1); 
     cc_idx = 1; % capital_changesに書き込むためのインデックス
     players = {}; % 空のプレイヤーリスト
     returns = zeros(iteration, 1);% 出力ファイルの初期化
 
     %Isingモデルの相互作用パラメータ
     delta = 0.05;    % デッドゾーン |x|<delta -> 0
-    alpha = 0.2;        % K の慣性
-    beta  = 1.0;        % 群衆が当たったら同調
-    theta = 1.0;        % 戦略表の重み
-    b_imax = 1.0;
-    Kclip = [-5, 5];  % K の上下限（暴走防止）
+    alpha = 0.7;        % K の慣性
+    %beta  = 0.5;        % 群衆が当たったら同調
+    theta = 0.5;        % 戦略表の重み
+    b_imax = 0.3;
+    Kclip = [-3, 3];  % K の上下限（暴走防止）
+
+    lambda = 5;         % Ising価格更新係数 λ
+    sigma_max = 0.05;   % 外部ニュース感度 σ_i の上限（例）
+    C_V        = 0.01;   % 私的雑音の基準分散（各エージェントに固定）
 
     %格子
     gridN = n; 
@@ -40,6 +56,7 @@ function market_sosg_ising_fast(n)
     player_id_grid = zeros(gridN, gridN); %追加: IDマップ行列を初期化
     D_prev = 0;      %D(t-1)
     r_prev = 0;      %r(t-1)
+    G_prev        = 0;                         % G(t-1) の記憶（K学習用）
 
     
     %% シミュレーションループ
@@ -48,6 +65,8 @@ function market_sosg_ising_fast(n)
         if mod(t, 1000) == 0
             fprintf('t = %d / %d, N = %d\n', t, iteration, numel(players));
         end
+
+        g_t = randn(); % 毎ステップ、新しい外部ニュースを生成
         
         N_current = numel(players);
         playerCounts(t) = N_current;
@@ -57,8 +76,8 @@ function market_sosg_ising_fast(n)
         %プレイヤーがいない時は新規参入
         if N_current == 0
             % 新規参入
-            [players, occupied, player_id_grid] = enter_market(players, occupied,player_id_grid, B, pattern, b_imax, gridN);
-            returns(t) = 0;
+            [players, occupied, player_id_grid] = enter_market(players, occupied,player_id_grid, B, pattern, b_imax, gridN, C_V, sigma_max);
+            %returns(t) = 0;
             continue;
         end
 
@@ -95,7 +114,7 @@ function market_sosg_ising_fast(n)
                
                 % sign内=K_i * Es + θ * s_strat
                 %hloc = sum( players{i}.K * Es(i) ) + theta * s_start;
-                hloc = (players{i}.K * Es(i)) + theta * s_strat;
+                hloc = (players{i}.K * Es(i)) + theta * s_strat + players{i}.sigma * g_t + players{i}.seps  * randn();
 
                 % デッドゾーン適用
                 if abs(hloc) < delta
@@ -116,19 +135,31 @@ function market_sosg_ising_fast(n)
             buy = 0; 
             sell = 0; 
             Qcap = 0;
+            Asum = 0;      % Σ a_i(t) （Ising価格更新
 
             for i = 1:N_current
                 %[action_pm1, players{i}] = decision(players{i}, B, history);
                 %if action_pm1 == 2       % buy
                 [act012, players{i}] = decision(players{i}, B, history);     % [FIX: 戻り値 0/1/2 に統一]
+               
                 if act012 == 2
                     buy  = buy  + players{i}.quantity;
                     Qcap = Qcap + players{i}.quantity;
-                %elseif action_pm1 == 0   % sell
+                    Asum = Asum + 1; % 行動が「買い(+1)」なのでAsumに+1
+
                 elseif act012 == 0       % sell
                     sell = sell + players{i}.quantity;
                     Qcap = Qcap + players{i}.quantity;
+                    Asum = Asum - 1; % 行動が「売り(-1)」なのでAsumに-1
                 end
+
+                % 市場価格の変化と定量化
+                if N_current > 0
+                    deltaP = (buy - sell) / N_current;
+                else
+                    deltaP = 0;
+                end
+    
             end
 
             % 市場の向き D(t) = (buy - sell)/Σq
@@ -136,13 +167,6 @@ function market_sosg_ising_fast(n)
                 D = (buy - sell) / Qcap;
             else
                 D = 0;
-            end
-    
-            % 市場価格の変化と定量化
-            if N_current > 0
-                deltaP = (buy - sell) / N_current;
-            else
-                deltaP = 0;
             end
     
             % 3) 認知側の更新
@@ -158,27 +182,35 @@ function market_sosg_ising_fast(n)
                 move = 2;
             end
 
-            cognitivePrice = cognitivePrice + (move - 2);%認知的価格更新
+            cognitivePrice = cognitivePrice + (move - 2);   %認知的価格更新
             history = mod(history * 5 + move, pattern);
     
             % 4) 価格とリターン
             %marketPrice    = marketPrice + deltaP;
-            marketPrice    = max(marketPrice + deltaP, eps);
-            r              = log(marketPrice) - log(preMarketPrice); %r(t)=Inp(t)-Inp(t-1)
+            %marketPrice = max(marketPrice + deltaP, 1e-8);
+            %r = log(marketPrice) - log(preMarketPrice);     %r(t)=Inp(t)-Inp(t-1)
+            if N_current > 0
+                r = (1/(lambda * N_current)) * Asum;      % << NEW: r(t) = (1/(λ N)) Σ a_i(t)
+            else
+                r = 0;
+            end
+            marketPrice    = preMarketPrice * exp(r);      % << NEW: p(t) = p(t-1) * exp(r)
             preMarketPrice = marketPrice; %市場価格の更新
 
-            % 5) K更新（b_i + α*K + β*r_prev*D_prev）
+            % 5) K更新（b_i + α*K + β*r_prev*G_prev）
             for i = 1:N_current
-                Ki = players{i}.b + alpha * players{i}.K + beta * (r_prev * D_prev);
+                Ki = players{i}.b + alpha * players{i}.K + beta * (r_prev * G_prev);
                 players{i}.K = clip(Ki, Kclip);
             end
             r_prev = r; 
-            D_prev = D;
+            G_prev = g_t;
+            %D_prev = D;
     
             % 6) プレイヤー状態の更新・退出処理
             if N_current > 0
                 keep_flags = true(1, N_current);
                 for i = 1:N_current
+
                     players{i} = open_prices(players{i}, cognitivePrice);
                     [players{i}, cap_change] = update_wealth(players{i}, B, cognitivePrice);
     
@@ -195,18 +227,38 @@ function market_sosg_ising_fast(n)
                 end
                 players = players(keep_flags);
 
-                %追加: プレイヤー退出・圧縮後にIDマップを再構築
-                player_id_grid = zeros(gridN, gridN); % いったんリセット
-                for i = 1:numel(players)
-                    pos = players{i}.pos;
-                    player_id_grid(pos(1), pos(2)) = i;
-                end
+                %プレイヤー退出・圧縮後にIDマップを再構築
+                %player_id_grid = zeros(gridN, gridN); % いったんリセット
+                %for i = 1:numel(players)
+                    %pos = players{i}.pos;
+                    %player_id_grid(pos(1), pos(2)) = i;
+                %end
+                [player_id_grid, occupied] = rebuild_maps(players, gridN);
             end
         end
     
             % 7) 新規参入（1人/t）
             %players{end+1} = create_player(B, pattern);
-            [players, occupied, player_id_grid] = enter_market(players, occupied, player_id_grid, B, pattern, b_imax, gridN);
+            [players, ~, ~] = enter_market(players, occupied, player_id_grid, B, pattern, b_imax, gridN, C_V, sigma_max);
+
+            [player_id_grid, occupied] = rebuild_maps(players, gridN); %追加
+
+            % 1) occupied と ID マップの一致
+            if any(occupied(:) ~= (player_id_grid(:) > 0))
+                error('occupied と player_id_grid の不整合を検出');
+            end
+
+            % 2) ID マップの範囲チェック
+            ids = player_id_grid(player_id_grid>0);
+            if ~isempty(ids) && (min(ids)<1 || max(ids)>numel(players))
+                error('ID マップが配列添字の範囲外を指しています');
+            end
+
+            % 3) 一意性チェック（重複 ID が無いか）
+            if numel(unique(ids)) ~= numel(ids)
+                error('ID マップに重複 ID が存在します');
+            end
+
 
     
             % 8) 記録
@@ -215,28 +267,29 @@ function market_sosg_ising_fast(n)
     end
 
 
-        tag = sprintf('n%d_B%d_theta%.1f_beta%.1f', n, B, theta, beta);
+        %tag = sprintf('n%d_B%d_delta%.1f_theta%.1f_beta%.1f_b_imax%.1f', n, B, delta, theta, beta, b_imax);
+        tag = num2str(beta, '%.15g');
 
         % 資産変動を保存
         %writematrix(capital_changes', sprintf('capital_changes_%s.csv', tag));
         capital_changes = capital_changes_prealloc(1:cc_idx-1);
-        writematrix(capital_changes, sprintf('capital_changes_%s.csv', tag));
+        writematrix(capital_changes, sprintf('lattice_capital_changes_%s.csv', tag));
         
         % プレイヤー数を保存・描画
-        writematrix(playerCounts, sprintf('player_counts_%s.csv', tag));
+        writematrix(playerCounts, sprintf('lattice_player_counts_%s.csv', tag));
         figure;
         plot(1:iteration, playerCounts);
         xlabel('t');
         ylabel('The number of players');
-        exportgraphics(gcf, sprintf('player_counts_%s.pdf', tag));
+        exportgraphics(gcf, sprintf('lattice_player_counts_%s.pdf', tag));
         
         % リターンを保存・描画
-        writematrix(returns, sprintf('return_%s.csv', tag));
+        writematrix(returns, sprintf('lattice_return_%s.csv', tag));
         figure;
         plot(returns);
         xlabel('t');
         ylabel('r(t)');
-        exportgraphics(gcf, sprintf('return_%s.pdf', tag));
+        exportgraphics(gcf, sprintf('lattice_return_%s.pdf', tag));
 
 end
 
@@ -246,60 +299,41 @@ function [act012, player] = decision(player, B, history)
     %action_pm1 = 0; % デフォルトはホールド
     act012 = 1;
 
-    if player.ongoing > 0 %自分のポジションがある
+    if player.ongoing > 0                                                           %自分のポジションがある
         %player.ongoing は「ポジションを持っている期間（ステップ数）」
-        player.ongoing = player.ongoing + 1; %ポジションを保持中なので経過期間を +1
-        if select ~= 1 && select ~= player.openPosition %今の推奨が1ではなく，かつ現在の方向とも逆
-            % 逆向き推奨が出たらこのステップは決済のみ（新規は出さない）
+        player.ongoing = player.ongoing + 1;                                        %ポジションを保持中なので経過期間を +1
+        dir = sign(player.s_prev);                                                  % Ising決定（近傍 + ニュース + 私的ノイズ）
+        if dir ~= 0 && dir ~= (player.openPosition - 1)
             player.tradePeriod = player.ongoing - 1;
-            player.settle = true; 
-            player.ongoing = 0; 
-            %action_pm1 = 1; %ホールド
-            %action_pm1 = -sign(player.openPosition - 1); % 買いポジション(2)なら-1, 売りポジション(0)なら+1
-            act012 = 1;
-            return
+            player.settle = true;  player.ongoing = 0;
+            act012 = 1;  
+            return;                              % 決済のみ
+        else
+            act012 = 1;  return;                 % 方向が同じならホールド
         end
-        % それ以外はポジションをホールド
-        act012 = 1;
 
     elseif select ~= 1
-        % 新規建て：方向は s_prev の符号で決める
-        %direction = player.s_prev;              % -1/0/+1
 
-        %if direction ~= 0 && floor(player.wealth / B) > 0
-            %if direction >= 0
-                %player.openPosition = 2; 
-            %else 
-                %player.openPosition = 0; 
-            %end
-            %player.quantity = floor(player.wealth / B);
-            %player.ongoing = 1;
-            %player.idlePeriod = player.idle;
-            %player.idle = 0;
-
-            %action_pm1 = direction;
-
-            dir = sign(player.s_prev);                              % -1/0/+1
-            q   = floor(player.wealth / B);
-
-            if dir ~= 0 && q > 0
-                if dir >= 0
-                    player.openPosition = 2; 
-                    act012 = 2;
+                dir = sign(player.s_prev);
+                q   = floor(player.wealth / B);
+                if dir == 0 || q <= 0
+                    act012      = 1;
+                    player.idle = player.idle + 1;
                 else
-                    player.openPosition = 0; 
-                    act012 = 0;
+                    if dir > 0
+                        player.openPosition = 2; act012 = 2;
+                    else
+                        player.openPosition = 0; act012 = 0;
+                    end
+
+                    player.quantity   = q;
+                    player.ongoing    = 1;
+                    player.idlePeriod = player.idle;
+                    player.idle       = 0;
                 end
-                player.quantity   = q;
-                player.ongoing    = 1;
-                player.idlePeriod = player.idle; 
-                player.idle = 0;
-            else
-                % 意欲ゼロ or 資金不足なら何もしない
-                player.idle = player.idle + 1;
-            end
-        else
-            player.idle = player.idle+1;
+
+    else
+        player.idle = player.idle+1;
     end
 end
 
@@ -313,7 +347,7 @@ function Es = local_expect_spin_fast(player_pos, player_s_prev, player_id_grid, 
     %position = players{i}.pos; 
     Es_sum = 0; 
     cnt = 0;
-    nbrs = [player_pos + [ -1 0]; 
+    nbrs = [player_pos + [-1 0]; 
             player_pos + [1 0]; 
             player_pos + [0 -1]; 
             player_pos + [0 1]];
@@ -325,12 +359,6 @@ function Es = local_expect_spin_fast(player_pos, player_s_prev, player_id_grid, 
         if x>=1 && x<=n && y>=1 && y<=n
             % IDマップを使って近傍プレイヤーのIDを瞬時に取得
             neighbor_id = player_id_grid(x, y);
-            %for j=1:numel(players)
-                %if all(players{j}.pos==[x y])
-                    %Es_sum = Es_sum + players{j}.s_prev; 
-                    %cnt=cnt+1; 
-                    %break;
-
 
             % IDが0でなければ（＝誰かがいれば）
             if neighbor_id > 0
@@ -349,7 +377,7 @@ end
 %end
 
 %% === プレイヤ生成（SOSG+Ising拡張） ===
-function player = create_player(B, pattern, position, b_imax)
+function player = create_player(B, pattern, position, b_imax, C_V, sigma_max)
     player.settle=false; 
     player.wealth=10*B; 
     player.quantity=0;
@@ -366,13 +394,15 @@ function player = create_player(B, pattern, position, b_imax)
     player.pos = position;
 
     % Ising(改) パラメータ
-    player.b = rand()*b_imax;
-    player.K = player.b;                      % 初期 k_i
+    player.b = rand() * b_imax;
+    player.K = 0.1;                      % 初期 k_i
     player.s_prev = 0;                    % 初期スピン期待
+    player.sigma = rand()*sigma_max;     % σ_i ~ U(0, σ_max)
+    player.seps   = C_V + 0.1*rand();      % 私的雑音の標準偏差 s_{ε,i}
 end
 
 %% === 新規プレイヤー参入 ===
-function [players, occupied, player_id_grid] = enter_market(players, occupied, player_id_grid, B, pattern, b_imax, gridN)
+function [players, occupied, player_id_grid] = enter_market(players, occupied, player_id_grid, B, pattern, b_imax, gridN, C_V, sigma_max)
     % 格子の空きを探す
     available_indices = find(~occupied);
     if ~isempty(available_indices)
@@ -385,7 +415,7 @@ function [players, occupied, player_id_grid] = enter_market(players, occupied, p
         new_player_id = numel(players) + 1;
 
 
-        players{new_player_id} = create_player(B, pattern, position, b_imax);
+        players{new_player_id} = create_player(B, pattern, position, b_imax, C_V, sigma_max);
         occupied(r_idx, c_idx) = true;
 
         % 追加: IDマップを更新
@@ -428,5 +458,20 @@ function s = rec2spin(rec)   % 0/1/2 -> -1/0/+1
         s=+1; 
     else 
         s=0; 
+    end
+end
+
+function [player_id_grid, occupied] = rebuild_maps(players, gridN)
+    player_id_grid = zeros(gridN, gridN);
+    occupied       = false(gridN, gridN);
+    for i = 1:numel(players)
+        pos = players{i}.pos;   % [row, col]
+        if ~isempty(pos)
+            r = pos(1); c = pos(2);
+            if r>=1 && r<=gridN && c>=1 && c<=gridN
+                player_id_grid(r, c) = i;   % 「配列添字＝ID」で再割当
+                occupied(r, c)       = true;
+            end
+        end
     end
 end
